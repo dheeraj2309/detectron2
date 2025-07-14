@@ -191,6 +191,49 @@ class DumpAction(InferenceAction):
         with open(out_fname, "wb") as hFile:
             torch.save(context["results"], hFile)
             logger.info(f"Output saved to {out_fname}")
+        # ==============================================================================
+        # ===== START OF THE NEW VERIFICATION CODE THAT CANNOT FAIL ====================
+        # ==============================================================================
+        logger.info("=" * 60)
+        logger.info("VERIFICATION STEP: ATTEMPTING TO LOAD THE FILE WE JUST SAVED")
+        logger.info("=" * 60)
+        try:
+            # We use torch.load with weights_only=False because the file contains custom classes
+            loaded_data = torch.load(out_fname, weights_only=False)
+
+            logger.info(">>> SUCCESS! File loaded back without errors.")
+            logger.info(f"Type of loaded data: {type(loaded_data)}")
+
+            if isinstance(loaded_data, list) and len(loaded_data) > 0:
+                logger.info(f"Number of images processed: {len(loaded_data)}")
+                first_entry = loaded_data[0]
+                logger.info("--- Data for the first image ---")
+                logger.info(f"File Name: {first_entry.get('file_name')}")
+                logger.info(f"Scores: {first_entry.get('scores')}")
+                logger.info(f"Bounding Boxes: {first_entry.get('pred_boxes_XYXY')}")
+                # This shows you have the densepose data object
+                if first_entry.get('pred_densepose'):
+                    logger.info(f"Number of people detected: {len(first_entry.get('pred_densepose'))}")
+                    logger.info(f"Type of DensePose result object: {type(first_entry.get('pred_densepose')[0])}")
+                logger.info("-" * 34)
+
+            # THIS IS WHERE YOU WOULD ADD YOUR OWN LOGIC TO PROCESS THE `loaded_data`
+            # For example:
+            # for entry in loaded_data:
+            #     print(f"Processing data for {entry['file_name']}")
+            #     # ... your logic here ...
+
+        except Exception as e:
+            logger.error(">>> FAILED to load back the data. This should not happen.")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error message: {e}")
+        logger.info("=" * 60)
+        logger.info("VERIFICATION COMPLETE. SCRIPT FINISHED.")
+        logger.info("=" * 60)
+        # ==============================================================================
+        # ===== END OF THE NEW VERIFICATION CODE =======================================
+        # ==============================================================================
+
 
 
 @register_action

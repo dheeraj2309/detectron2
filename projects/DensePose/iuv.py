@@ -9,7 +9,8 @@ from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
 
 from densepose import add_densepose_config
-from densepose.structures import DensePoseResultExtractor
+# CORRECTED IMPORT PATH:
+from densepose.vis.extractor import DensePoseResultExtractor
 from densepose.vis.densepose_results import DensePoseResultsVisualizerWithTexture
 
 def setup_densepose_predictor(config_fpath, model_fpath):

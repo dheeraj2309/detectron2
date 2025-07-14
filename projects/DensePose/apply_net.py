@@ -8,6 +8,7 @@ import os
 import sys
 from typing import Any, ClassVar, Dict, List
 import torch
+import numpy as np
 
 from detectron2.config import CfgNode, get_cfg
 from detectron2.data.detection_utils import read_image
@@ -41,6 +42,44 @@ from densepose.vis.extractor import (
     DensePoseResultExtractor,
     create_extractor,
 )
+
+class DensePoseResultsIUVVisualizer(object):
+    def __init__(self, **kwargs):
+        pass
+
+    def visualize(self, image_bgr: np.ndarray, densepose_results) -> np.ndarray:
+        # Create a black background of the same size as the input image
+        iuv_image = np.zeros_as(image_bgr)
+        # densepose_results is a list of results for each detected person
+        for result in densepose_results:
+            # The result has 'labels' (I) and 'uv' (U, V)
+            # .labels is a tensor of shape [H, W] with part indices
+            # .uv is a tensor of shape [2, H, W] with U and V values
+            i_map = result.labels.cpu().numpy().astype(np.uint8)
+            uv_map = result.uv.cpu().numpy()
+            
+            # Get the bounding box to work on a smaller region
+            x, y, w, h = result.bbox_xywh
+            x, y, w, h = int(x), int(y), int(w), int(h)
+
+            # Prepare the I, U, V channels
+            I = i_map[y : y + h, x : x + w]
+            # Scale U and V from [0, 1] to [0, 255]
+            U = (uv_map[0, y : y + h, x : x + w] * 255).astype(np.uint8)
+            V = (uv_map[1, y : y + h, x : x + w] * 255).astype(np.uint8)
+            
+            # Find the pixels that belong to the person (where I > 0)
+            mask = I > 0
+            
+            # Compose the IUV values into the BGR channels of the image
+            # The standard VTON format is:
+            # Red Channel -> I (Part Index)
+            # Green Channel -> U
+            # Blue Channel -> V
+            # OpenCV uses BGR, so we map V->B, U->G, I->R
+            iuv_image[y : y + h, x : x + w][mask] = np.stack((V[mask], U[mask], I[mask]), axis=-1)
+            
+        return iuv_image
 
 DOC = """Apply Net - a tool to print / visualize DensePose results
 """
@@ -201,6 +240,7 @@ class ShowAction(InferenceAction):
 
     COMMAND: ClassVar[str] = "show"
     VISUALIZERS: ClassVar[Dict[str, object]] = {
+        "dp_iuv_raw": DensePoseResultsIUVVisualizer,
         "dp_contour": DensePoseResultsContourVisualizer,
         "dp_segm": DensePoseResultsFineSegmentationVisualizer,
         "dp_u": DensePoseResultsUVisualizer,

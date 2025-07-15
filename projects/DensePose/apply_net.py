@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Dict, List
 import torch
 import numpy as np
 from tqdm import tqdm
+import cv2
 
 from detectron2.config import CfgNode, get_cfg
 from detectron2.data.detection_utils import read_image
@@ -350,19 +351,14 @@ class DumpPlainAction(InferenceAction):
 @register_action
 class IUVAction(InferenceAction):
     """
-    Action that outputs IUV images.
-    An IUV image is a 3-channel image where the channels are encoded as follows:
-    - Channel 0 (Blue): V coordinate
-    - Channel 1 (Green): U coordinate
-    - Channel 2 (Red): Body part index (I)
-    Note: OpenCV uses BGR order, so we save (V, U, I) to get (B, G, R).
+    Action to generate and save IUV-map images for a dataset.
     """
 
     COMMAND: ClassVar[str] = "iuv"
 
     @classmethod
     def add_parser(cls: type, subparsers: argparse._SubParsersAction):
-        parser = subparsers.add_parser(cls.COMMAND, help="Dump IUV image outputs.")
+        parser = subparsers.add_parser(cls.COMMAND, help="Generate IUV images for a dataset.")
         cls.add_arguments(parser)
         parser.set_defaults(func=cls.execute)
 
@@ -371,428 +367,99 @@ class IUVAction(InferenceAction):
         super(IUVAction, cls).add_arguments(parser)
         parser.add_argument(
             "--output",
-            metavar="<dump_file>",
-            default="output_iuv.png",
-            help="File name to save IUV image to.",
+            metavar="<output_dir>",
+            default="output/densepose",
+            help="Directory to save IUV image outputs. Will preserve input folder structure.",
         )
+        # Add an argument to define the root of the input dataset for relative path calculation
+        parser.add_argument(
+            "--input-root",
+            metavar="<input_root>",
+            default=None,
+            help="Root directory of the input dataset. If provided, paths will be relative to this root.",
+        )
+
+    @classmethod
+    def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
+        # The extractor to get DensePose results from model outputs
+        extractor = DensePoseResultExtractor()
+        context = {"extractor": extractor, "output_dir": args.output, "input_root": args.input_root}
+        if args.input_root and not os.path.isdir(args.input_root):
+            logger.error(f"Provided --input-root '{args.input_root}' is not a valid directory.")
+            raise NotADirectoryError(f"Provided --input-root '{args.input_root}' is not a valid directory.")
+        return context
 
     @classmethod
     def execute_on_outputs(
         cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
     ):
-        import cv2
-        import numpy as np # Ensure numpy is imported
+        extractor = context["extractor"]
+        # Extract DensePose results from model outputs
+        results_densepose = extractor(outputs)[0]
 
-        image_fpath = entry["file_name"]
-        logger.info(f"Processing {image_fpath}")
-
-        # Ensure model output is for chart-based models which have I,U,V data
-        if not outputs.has("pred_densepose") or not isinstance(
-            outputs.pred_densepose, DensePoseChartPredictorOutput
-        ):
-            logger.warning(
-                f"Could not find DensePoseChartPredictorOutput in outputs for {image_fpath}. Skipping."
-            )
-            return
-
-        # Create a blank (black) image to draw the IUV data on
+        # Create a blank image to store the IUV map
         h, w, _ = entry["image"].shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        # Extractor gets the IUV data from the raw model output
-        extractor = DensePoseResultExtractor()
-        densepose_results = extractor(outputs)[0]
 
-        if not densepose_results:
-            logger.warning(f"No DensePose detections for {image_fpath}. Saving black image.")
+        # Results are sorted by score, so later instances (higher score) overwrite earlier ones.
+        for result in results_densepose:
+            # result is a DensePoseData object
+            x, y, box_w, box_h = result.bbox_xywh.cpu().numpy().astype(int)
+
+            # Get the I, U, V data for the bounding box
+            i_map = result.i.cpu().numpy()
+            u_map = result.u.cpu().numpy()
+            v_map = result.v.cpu().numpy()
+            
+            # Use BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
+            iuv_in_box = np.stack(
+                [
+                    i_map.astype(np.uint8),
+                    (u_map * 255).astype(np.uint8),
+                    (v_map * 255).astype(np.uint8),
+                ],
+                axis=2,
+            )
+            
+            # Create a mask for where to paint the IUV data
+            mask = i_map > 0
+            
+            # Define slices for copying data to avoid out-of-bounds errors
+            img_y1, img_y2 = max(0, y), min(h, y + box_h)
+            img_x1, img_x2 = max(0, x), min(w, x + box_w)
+            
+            box_y1, box_y2 = img_y1 - y, img_y2 - y
+            box_x1, box_x2 = img_x1 - x, img_x2 - x
+
+            # Combine masks and copy data
+            img_slice = (slice(img_y1, img_y2), slice(img_x1, img_x2))
+            box_slice = (slice(box_y1, box_y2), slice(box_x1, box_x2))
+            
+            mask_valid = mask[box_slice]
+            iuv_image[img_slice][mask_valid] = iuv_in_box[box_slice][mask_valid]
+
+        # --- Determine and create output path ---
+        file_name = entry["file_name"]
+        input_root = context.get("input_root")
+
+        if input_root:
+            # Preserve directory structure relative to the input_root
+            relative_path = os.path.relpath(file_name, input_root)
+            out_path = os.path.join(context["output_dir"], relative_path)
         else:
-            # Iterate over each detected instance
-            for i, result in enumerate(densepose_results):
-                x, y, w_box, h_box = outputs.pred_boxes.tensor[i].int().tolist()
-                
-                i_map = result.labels.squeeze().to(torch.uint8)
-                u_map = (result.uv.squeeze()[0] * 255).to(torch.uint8)
-                v_map = (result.uv.squeeze()[1] * 255).to(torch.uint8)
+            # Use a flat structure in the output directory
+            base_name = os.path.basename(file_name)
+            out_path = os.path.join(context["output_dir"], base_name)
+            
+        # Change extension to .png for lossless saving
+        out_path = os.path.splitext(out_path)[0] + ".png"
 
-                # OpenCV uses BGR order, so we stack (V, U, I) to save correctly.
-                iuv_patch = torch.stack([v_map, u_map, i_map], dim=-1).cpu().numpy()
-                mask = iuv_patch[:, :, 2] > 0
-                
-                # Ensure the patch fits within the image boundaries
-                y1, y2 = y, y + h_box
-                x1, x2 = x, x + w_box
-                patch_h, patch_w, _ = iuv_patch.shape
-                
-                # Clip coordinates to be within image bounds
-                y1_p, y2_p = max(0, y1), min(h, y2)
-                x1_p, x2_p = max(0, x1), min(w, x2)
-
-                # Calculate corresponding slice from the patch
-                y1_patch = y1_p - y1
-                y2_patch = y1_patch + (y2_p - y1_p)
-                x1_patch = x1_p - x1
-                x2_patch = x1_patch + (x2_p - x1_p)
-
-                # Paste the valid part of the IUV patch onto the main IUV image
-                iuv_image[y1_p:y2_p, x1_p:x2_p][mask[y1_patch:y2_patch, x1_patch:x2_patch]] = \
-                    iuv_patch[y1_patch:y2_patch, x1_patch:x2_patch][mask[y1_patch:y2_patch, x1_patch:x2_patch]]
-
-        entry_idx = context["entry_idx"]
-        out_fname = cls._get_out_fname(context, entry_idx, context["out_fname"])
-        out_dir = os.path.dirname(out_fname)
-        if len(out_dir) > 0 and not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        
-        cv2.imwrite(out_fname, iuv_image)
-        logger.info(f"IUV image saved to {out_fname}")
-
-    @classmethod
-    def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode) -> Dict[str, Any]:
-        context = { "out_fname": args.output }
-        return context
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        cv2.imwrite(out_path, iuv_image)
 
     @classmethod
     def postexecute(cls: type, context: Dict[str, Any]):
-        pass
-
-@register_action
-class BatchIUVAction(InferenceAction):
-    """
-    Action that outputs IUV images using batch processing for higher throughput on GPU.
-    """
-
-    COMMAND: ClassVar[str] = "batchiuv"
-
-    @classmethod
-    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
-        parser = subparsers.add_parser(
-            cls.COMMAND, help="Dump IUV images in batches for high performance."
-        )
-        cls.add_arguments(parser)
-        parser.set_defaults(func=cls.execute)
-
-    @classmethod
-    def add_arguments(cls: type, parser: argparse.ArgumentParser):
-        super(BatchIUVAction, cls).add_arguments(parser)
-        parser.add_argument(
-            "--output",
-            metavar="<dump_file>",
-            default="output_iuv.png",
-            help="File name template to save IUV images to.",
-        )
-        parser.add_argument(
-            "--batch-size",
-            metavar="<N>",
-            type=int,
-            default=8,
-            help="Number of images to process in a single batch. Adjust based on GPU memory.",
-        )
-
-
-    @staticmethod
-    def _create_iuv_image_from_output(original_image, outputs):
-        """
-        Helper function to generate a single IUV image from a model output.
-        This version includes DEBUG prints to diagnose shape mismatches.
-        """
-        import cv2
-        import numpy as np
-
-        h, w, _ = original_image.shape
-        iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
-
-        if not outputs.has("pred_densepose") or not isinstance(
-            outputs.pred_densepose, DensePoseChartPredictorOutput
-        ):
-            return iuv_image
-
-        extractor = DensePoseResultExtractor()
-        densepose_results = extractor(outputs)[0]
-
-        if not densepose_results:
-            return iuv_image
-
-        for i, result in enumerate(densepose_results):
-            # --- START OF THE DEBUG BLOCK ---
-            print(f"\n--- DEBUG: Processing Instance {i} ---")
-            
-            # Check if attributes exist before accessing them
-            if not hasattr(result, 'labels') or not hasattr(result, 'uv'):
-                print("  > Instance is missing 'labels' or 'uv' attribute. Skipping.")
-                continue
-
-            print(f"  > Raw result.labels shape: {result.labels.shape}")
-            print(f"  > Raw result.uv shape:    {result.uv.shape}")
-
-            i_map = result.labels.squeeze()
-            uv_map = result.uv.squeeze()
-
-            print(f"  > Squeezed i_map shape: {i_map.shape} (dims: {i_map.dim()})")
-            print(f"  > Squeezed uv_map shape: {uv_map.shape} (dims: {uv_map.dim()})")
-            
-            # Deconstruct the condition to see which part fails
-            cond1 = i_map.dim() != 2
-            cond2 = uv_map.dim() != 3
-            # IMPORTANT: only check shape[0] if the dimension check passes, otherwise it will error
-            cond3 = False 
-            if not cond2:
-                cond3 = uv_map.shape[0] != 2
-
-            print("  > Evaluating conditions for skipping:")
-            print(f"    - i_map.dim() != 2         -> {cond1}")
-            print(f"    - uv_map.dim() != 3        -> {cond2}")
-            if not cond2:
-                 print(f"    - uv_map.shape[0] != 2     -> {cond3}")
-            
-            # The original condition check
-            if cond1 or cond2 or cond3:
-                print("  > !!! AT LEAST ONE CONDITION FAILED. SKIPPING INSTANCE. !!!")
-                logger.warning("Skipping an instance due to unexpected DensePose map dimensions.")
-                continue
-            
-            print("  > All conditions PASSED. Proceeding to render.")
-            # --- END OF THE DEBUG BLOCK ---
-
-            # Get the true height and width from the IUV map itself
-            patch_h, patch_w = i_map.shape[-2:] # Use last two dims for safety
-            
-            u_map = (uv_map[0, :, :] * 255).to(torch.uint8).cpu().numpy()
-            v_map = (uv_map[1, :, :] * 255).to(torch.uint8).cpu().numpy()
-            i_map_numpy = i_map.to(torch.uint8).cpu().numpy()
-            
-            iuv_patch = np.stack([v_map, u_map, i_map_numpy], axis=-1)
-            mask = iuv_patch[:, :, 2] > 0
-            
-            x1, y1, _, _ = outputs.pred_boxes.tensor[i].int().tolist()
-            x2 = x1 + patch_w
-            y2 = y1 + patch_h
-
-            y1_c, y2_c = max(0, y1), min(h, y2)
-            x1_c, x2_c = max(0, x1), min(w, x2)
-            
-            y_patch_start, y_patch_end = y1_c - y1, y2_c - y1
-            x_patch_start, x_patch_end = x1_c - x1, x2_c - x1
-            
-            valid_patch = iuv_patch[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
-            valid_mask = mask[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
-            
-            region_to_write = iuv_image[y1_c:y2_c, x1_c:x2_c]
-            region_to_write[valid_mask] = valid_patch[valid_mask]
-        
-        return iuv_image
-
-    @classmethod
-    def execute(cls: type, args: argparse.Namespace):
-        import cv2
-        from detectron2.data import transforms as T
-
-        logger.info(f"Loading config from {args.cfg}")
-        cfg = cls.setup_config(args.cfg, args.model, args, [])
-        logger.info(f"Loading model from {args.model}")
-        
-        # We need the model directly, not the DefaultPredictor
-        model = DefaultPredictor(cfg).model
-        
-        logger.info(f"Loading data from {args.input}")
-        file_list = cls._get_input_file_list(args.input)
-        if len(file_list) == 0:
-            logger.warning(f"No input images for {args.input}")
-            return
-            
-        # Create batches of file names
-        batch_size = args.batch_size
-        batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
-        
-        file_idx = 0
-        context = {"total_entries": len(file_list), "out_fname": args.output}
-        
-        for batch_files in tqdm(batches, desc=f"Processing in batches of {batch_size}"):
-            # 1. Load and preprocess a batch of images
-            batch_inputs = []
-            original_images = []
-            for file_name in batch_files:
-                original_image = read_image(file_name, format="BGR")
-                original_images.append(original_image)
-                height, width = original_image.shape[:2]
-                # Preprocessing from DefaultPredictor logic
-                aug = T.ResizeShortestEdge([cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST)
-                image = aug.get_transform(original_image).apply_image(original_image)
-                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-                batch_inputs.append({"image": image, "height": height, "width": width})
-
-            # 2. Run inference on the whole batch
-            with torch.no_grad():
-                # The model can take a list of inputs and processes them in a batch
-                batch_outputs = model(batch_inputs)
-            
-            # 3. Post-process and save results for this batch
-            for i in range(len(batch_outputs)):
-                outputs_per_image = {"instances": batch_outputs[i]["instances"]}
-                iuv_image = cls._create_iuv_image_from_output(original_images[i], outputs_per_image["instances"])
-                
-                if iuv_image is not None:
-                    out_fname = cls._get_out_fname(context, file_idx, args.output)
-                    out_dir = os.path.dirname(out_fname)
-                    if len(out_dir) > 0 and not os.path.exists(out_dir):
-                        os.makedirs(out_dir)
-                    cv2.imwrite(out_fname, iuv_image)
-                
-                file_idx += 1
-
-@register_action
-class PipelineAction(InferenceAction):
-    """
-    Action that uses a two-stage pipeline for robust IUV image generation.
-    Stage 1: Batch-process all images and store raw results in memory.
-    Stage 2: Loop through stored results and generate final IUV images.
-    """
-
-    COMMAND: ClassVar[str] = "pipeline"
-
-    @classmethod
-    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
-        parser = subparsers.add_parser(
-            cls.COMMAND, help="Robustly generate IUV images using a two-stage pipeline."
-        )
-        cls.add_arguments(parser)
-        parser.set_defaults(func=cls.execute)
-
-    @classmethod
-    def add_arguments(cls: type, parser: argparse.ArgumentParser):
-        super(PipelineAction, cls).add_arguments(parser)
-        parser.add_argument(
-            "--output",
-            metavar="<dump_file>",
-            default="output_iuv.png",
-            help="File name template to save IUV images to.",
-        )
-        parser.add_argument(
-            "--batch-size",
-            metavar="<N>",
-            type=int,
-            default=8,
-            help="Number of images to process in a single batch. Adjust based on GPU memory.",
-        )
-
-    @staticmethod
-    def _generate_image_from_data(data_item: Dict[str, Any]) -> np.ndarray:
-        """
-        Takes a dictionary of pre-computed raw data and generates a final IUV image.
-        This is the core of Stage 2.
-        """
-        import cv2
-        import numpy as np
-
-        # Unpack the data from the dictionary
-        h = data_item["original_h"]
-        w = data_item["original_w"]
-        outputs = data_item["outputs"]
-        
-        iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
-
-        if not outputs.has("pred_densepose") or not isinstance(
-            outputs.pred_densepose, DensePoseChartPredictorOutput
-        ):
-            return iuv_image
-
-        extractor = DensePoseResultExtractor()
-        densepose_results = extractor(outputs)[0]
-
-        if not densepose_results:
-            return iuv_image
-
-        for i, result in enumerate(densepose_results):
-            x1, y1, _, _ = outputs.pred_boxes.tensor[i].int().tolist()
-            i_map_tensor = result.labels.squeeze()
-            uv_map_tensor = result.uv.squeeze()
-
-            if i_map_tensor.dim() != 2 or uv_map_tensor.dim() != 3 or uv_map_tensor.shape[0] != 2:
-                continue
-            
-            # Convert to numpy and scale for visualization
-            u_map_np = (uv_map_tensor[0, :, :] * 255).to(torch.uint8).cpu().numpy()
-            v_map_np = (uv_map_tensor[1, :, :] * 255).to(torch.uint8).cpu().numpy()
-            i_map_np = i_map_tensor.to(torch.uint8).cpu().numpy()
-            i_map_scaled_for_vis = (i_map_np * 10).clip(0, 255).astype(np.uint8)
-
-            # Create the patch and mask
-            patch_h, patch_w = i_map_np.shape
-            iuv_patch = np.stack([v_map_np, u_map_np, i_map_scaled_for_vis], axis=-1)
-            mask = (i_map_np > 0)
-            
-            # Define destination and paste (no resizing)
-            x2, y2 = x1 + patch_w, y1 + patch_h
-            y1_c, y2_c = max(0, y1), min(h, y2)
-            x1_c, x2_c = max(0, x1), min(w, x2)
-            y_patch_start, y_patch_end = y1_c - y1, y2_c - y1
-            x_patch_start, x_patch_end = x1_c - x1, x2_c - x1
-            
-            valid_patch = iuv_patch[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
-            valid_mask = mask[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
-            
-            region_to_write = iuv_image[y1_c:y2_c, x1_c:x2_c]
-            region_to_write[valid_mask] = valid_patch[valid_mask]
-        
-        return iuv_image
-
-    @classmethod
-    def execute(cls: type, args: argparse.Namespace):
-        import cv2
-        from detectron2.data import transforms as T
-
-        # --- Initial Setup ---
-        logger.info(f"Loading config from {args.cfg}")
-        cfg = cls.setup_config(args.cfg, args.model, args, [])
-        model = DefaultPredictor(cfg).model
-        file_list = cls._get_input_file_list(args.input)
-        if not file_list:
-            logger.warning(f"No input images for {args.input}")
-            return
-        
-        # --- STAGE 1: Batch Inference and In-Memory Storage ---
-        logger.info(f"Starting Stage 1: Batch Inference ({len(file_list)} images)...")
-        extracted_data = []
-        batch_size = args.batch_size
-        batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
-        
-        for batch_files in tqdm(batches, desc=f"Stage 1: Inferencing in batches of {batch_size}"):
-            batch_inputs, original_metas = [], []
-            for file_name in batch_files:
-                original_image = read_image(file_name, format="BGR")
-                h, w = original_image.shape[:2]
-                aug = T.ResizeShortestEdge([cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST)
-                image = aug.get_transform(original_image).apply_image(original_image)
-                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-                batch_inputs.append({"image": image, "height": h, "width": w})
-                original_metas.append({"file_path": file_name, "original_h": h, "original_w": w})
-
-            with torch.no_grad():
-                batch_outputs = model(batch_inputs)
-            
-            # Store results along with metadata
-            for i, output in enumerate(batch_outputs):
-                data_item = original_metas[i]
-                data_item["outputs"] = output["instances"]
-                extracted_data.append(data_item)
-        
-        logger.info("Stage 1 complete. All raw data extracted.")
-
-        # --- STAGE 2: Image Generation from Stored Data ---
-        logger.info("Starting Stage 2: Generating IUV images...")
-        context = {"total_entries": len(extracted_data), "out_fname": args.output}
-        
-        for i, data_item in enumerate(tqdm(extracted_data, desc="Stage 2: Generating Images")):
-            # Generate the IUV image using our reliable static method
-            iuv_image = cls._generate_image_from_data(data_item)
-            
-            # Get output file name and save the image
-            out_fname = cls._get_out_fname(context, i, args.output)
-            out_dir = os.path.dirname(out_fname)
-            if len(out_dir) > 0 and not os.path.exists(out_dir):
-                os.makedirs(out_dir)
-            cv2.imwrite(out_fname, iuv_image)
-            
-        logger.info("Pipeline finished successfully. All images saved.")
+        logger.info(f"Finished processing. IUV images saved in {context['output_dir']}")
 
 @register_action
 class ShowAction(InferenceAction):

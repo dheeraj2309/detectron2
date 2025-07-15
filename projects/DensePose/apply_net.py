@@ -403,19 +403,17 @@ class IUVAction(InferenceAction):
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
 
         # Results are sorted by score, so later instances (higher score) overwrite earlier ones.
-        for i,result in enumerate(results_densepose):
+        if results_densepose:
             # result is a DensePoseData object
-            x1, y1, x2, y2 = pred_boxes[i]
-            x, y = int(x1), int(y1)
-            box_w, box_h = int(x2 - x1), int(y2 - y1)
-            print("yaha box ki dimesnions nikli hai")
+            dp_result = results_densepose[0]
+            box = pred_boxes[0].to(dtype=torch.int).numpy()
+            i_map_tensor = dp_result.labels
+            uv_map_tensor = dp_result.uv
 
-            # Now, the rest of the original logic can proceed, as it has the correct bbox info.
-            # Get the I, U, V data for the bounding box from the result object
-            i_map = result.labels.cpu().numpy() # Note: it's in result.labels
-            u_map = result.uv.cpu().numpy()[1, :, :]
-            v_map = result.uv.cpu().numpy()[0, :, :]
-            print('yaha i , u , v ke map nikle')
+            i_map = i_map_tensor.cpu().numpy()
+            # The UV tensor is shape (2, H, W). Index 1 is U, Index 0 is V.
+            u_map = uv_map_tensor.cpu().numpy()[1, :, :]
+            v_map = uv_map_tensor.cpu().numpy()[0, :, :]
             
             # Use BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
             iuv_in_box = np.stack(

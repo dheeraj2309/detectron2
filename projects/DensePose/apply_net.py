@@ -336,13 +336,89 @@ class DumpPlainAction(InferenceAction):
             logger.info(f"Plain data output saved to {out_fname}")
         logger.info("This file can now be loaded anywhere with PyTorch, without the DensePose project.")
 
+@register_action
+class DumpNpzAction(InferenceAction):
+    """
+    Dump action that outputs results to a compressed .npz file for each image.
+    This is highly recommended for its small file size and portability.
+    """
+    COMMAND: ClassVar[str] = "dumpnpz"
+
+    @classmethod
+    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
+        parser = subparsers.add_parser(
+            cls.COMMAND, help="Dump densepose data to a compressed .npz file per image."
+        )
+        cls.add_arguments(parser)
+        parser.set_defaults(func=cls.execute)
+
+    @classmethod
+    def add_arguments(cls: type, parser: argparse.ArgumentParser):
+        super(DumpNpzAction, cls).add_arguments(parser)
+        parser.add_argument(
+            "--output",
+            metavar="<output_dir>",
+            default="output/densepose_npz",
+            help="Directory to save .npz files to. Preserves input folder structure.",
+        )
+        parser.add_argument(
+            "--input-root",
+            metavar="<input_root>",
+            default=None,
+            help="Root directory of the input dataset for relative path calculation.",
+        )
+
+    @classmethod
+    def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
+        return {"output_dir": args.output, "input_root": args.input_root}
+
+    @classmethod
+    def execute_on_outputs(
+        cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
+    ):
+        file_name = entry["file_name"]
+        out_path = cls.get_output_path(file_name, context["output_dir"], ".npz", context["input_root"])
+
+        if not outputs.has("pred_densepose") or len(outputs) == 0:
+            # Save an empty file to indicate no detection
+            np.savez_compressed(out_path, scores=np.array([]))
+            return
+
+        # We are interested in chart-based outputs (I, U, V)
+        if not isinstance(outputs.pred_densepose, DensePoseChartPredictorOutput):
+            logger.warning(f"Model output is not Chart-based for {file_name}. Skipping.")
+            np.savez_compressed(out_path, scores=np.array([]))
+            return
+            
+        extractor = DensePoseResultExtractor()
+        results_densepose = extractor(outputs)[0]
+        
+        # Take the detection with the highest score
+        dp_result = results_densepose[0]
+        box_xywh = outputs.pred_boxes.tensor[0].cpu().numpy() # x,y,w,h
+        score = outputs.scores[0].cpu().numpy()
+
+        i_map = dp_result.labels.cpu().numpy()
+        uv_map = dp_result.uv.cpu().numpy() # Shape: (2, H, W)
+        
+        np.savez_compressed(
+            out_path,
+            scores=score,
+            pred_boxes_XYWH=box_xywh,
+            pred_densepose_I=i_map,
+            pred_densepose_UV=uv_map,
+        )
+
+    @classmethod
+    def postexecute(cls: type, context: Dict[str, Any]):
+        logger.info(f"Finished processing. NPZ files saved in {context['output_dir']}")
 
 @register_action
 class IUVAction(InferenceAction):
     """
     Action to generate and save IUV-map images for a dataset.
+    This version is robust to off-screen bounding boxes.
     """
-
     COMMAND: ClassVar[str] = "iuv"
 
     @classmethod
@@ -358,93 +434,78 @@ class IUVAction(InferenceAction):
             "--output",
             metavar="<output_dir>",
             default="output/densepose_iuv",
-            help="Directory to save IUV image outputs. Will preserve input folder structure.",
+            help="Directory to save IUV image outputs.",
         )
         parser.add_argument(
             "--input-root",
             metavar="<input_root>",
             default=None,
-            help="Root directory of the input dataset. If provided, paths will be relative to this root.",
+            help="Root directory of the input dataset for relative path calculation.",
         )
 
     @classmethod
     def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
-        extractor = DensePoseResultExtractor()
-        context = {"extractor": extractor, "output_dir": args.output, "input_root": args.input_root}
-        if args.input_root and not os.path.isdir(args.input_root):
-            msg = f"Provided --input-root '{args.input_root}' is not a valid directory."
-            logger.error(msg)
-            raise NotADirectoryError(msg)
-        return context
+        return {"output_dir": args.output, "input_root": args.input_root}
 
     @classmethod
     def execute_on_outputs(
         cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
     ):
-        extractor = context["extractor"]
-        results_densepose = extractor(outputs)[0]
+        file_name = entry["file_name"]
+        out_path = cls.get_output_path(file_name, context["output_dir"], ".png", context["input_root"])
+
+        img_h, img_w, _ = entry["image"].shape
+        iuv_image = np.zeros((img_h, img_w, 3), dtype=np.uint8)
         
-        h, w, _ = entry["image"].shape
-        iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
+        # Only proceed if there are detections with the correct densepose output type
+        if (
+            outputs.has("pred_densepose") and len(outputs) > 0 and 
+            isinstance(outputs.pred_densepose, DensePoseChartPredictorOutput)
+        ):
+            extractor = DensePoseResultExtractor()
+            dp_result = extractor(outputs)[0][0] # Get the top-scoring result
+            box_xyxy = outputs.pred_boxes.tensor[0].cpu().int().numpy()
 
-        # The results are sorted by score, so we take the first one.
-        if results_densepose and outputs.has("pred_boxes"):
-            # Get the best detection's data
-            dp_result = results_densepose[0]
-            box_xywh = outputs.pred_boxes.tensor[0].cpu().int().numpy()
-            x, y, ww, hh = box_xywh
-            box_xyxy = [x, y, x + ww, y + hh]
-            
-            i_map_tensor = dp_result.labels
-            uv_map_tensor = dp_result.uv
-
-            # Create the IUV data for the bounding box
-            i_map = i_map_tensor.cpu().numpy().astype(np.uint8)
-            u_map = (uv_map_tensor.cpu().numpy()[1, :, :] * 255).astype(np.uint8)
-            v_map = (uv_map_tensor.cpu().numpy()[0, :, :] * 255).astype(np.uint8)
+            i_map_full = dp_result.labels.cpu().numpy().astype(np.uint8)
+            uv_map_full = dp_result.uv.cpu().numpy()
             
             # BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
-            iuv_in_box = np.stack([i_map, u_map, v_map], axis=2)
-            
-            # Define the region to paste into, with clipping
-            x1_img, y1_img = max(box_xyxy[0], 0), max(box_xyxy[1], 0)
-            x2_img, y2_img = min(box_xyxy[2], w), min(box_xyxy[3], h)
-            
-            # Define the source region from the IUV data
-            x1_src = x1_img - box_xyxy[0]
-            y1_src = y1_img - box_xyxy[1]
-            x2_src = x1_src + (x2_img - x1_img)
-            y2_src = y1_src + (y2_img - y1_img)
-            
-            if x2_src > x1_src and y2_src > y1_src:
-                mask = i_map[y1_src:y2_src, x1_src:x2_src] > 0
+            u_map = (uv_map_full[1, :, :] * 255).astype(np.uint8)
+            v_map = (uv_map_full[0, :, :] * 255).astype(np.uint8)
+            iuv_in_box = np.stack([i_map_full, u_map, v_map], axis=2)
+
+            # --- ROBUST PASTING LOGIC TO PREVENT IndexError ---
+            # 1. Get box coordinates and clip to image dimensions
+            x1_box, y1_box, x2_box, y2_box = box_xyxy
+            x1_img = max(x1_box, 0)
+            y1_img = max(y1_box, 0)
+            x2_img = min(x2_box, img_w)
+            y2_img = min(y2_box, img_h)
+
+            # 2. If the box is completely outside the image, do nothing
+            if x1_img >= x2_img or y1_img >= y2_img:
+                pass
+            else:
+                # 3. Calculate source coordinates from the unclipped box data
+                x1_src = x1_img - x1_box
+                y1_src = y1_img - y1_box
+                x2_src = x2_img - x1_box
+                y2_src = y2_img - y1_box
+                
+                # 4. Slice the data and mask from the source
                 iuv_patch = iuv_in_box[y1_src:y2_src, x1_src:x2_src]
-                iuv_image[y1_img:y2_img, x1_img:x2_img][mask] = iuv_patch[mask]
+                mask = iuv_patch[:, :, 0] > 0 # Use the 'I' channel as the mask
 
-        # Determine and create output path
-        file_name = entry["file_name"]
-        input_root = context.get("input_root")
+                # 5. Get the destination view and paste using the mask
+                dest_view = iuv_image[y1_img:y2_img, x1_img:x2_img]
+                dest_view[mask] = iuv_patch[mask]
 
-        if input_root:
-            relative_path = os.path.relpath(os.path.dirname(file_name), input_root)
-            base_name = os.path.basename(file_name)
-            out_dir = os.path.join(context["output_dir"], relative_path)
-            out_path = os.path.join(out_dir, base_name)
-        else:
-            base_name = os.path.basename(file_name)
-            out_dir = context["output_dir"]
-            out_path = os.path.join(out_dir, base_name)
-            
-        # Change extension to .png for lossless saving
-        out_path = os.path.splitext(out_path)[0] + ".png"
-
-        os.makedirs(out_dir, exist_ok=True)
         cv2.imwrite(out_path, iuv_image)
+
 
     @classmethod
     def postexecute(cls: type, context: Dict[str, Any]):
         logger.info(f"Finished processing. IUV images saved in {context['output_dir']}")
-
 
 @register_action
 class ShowAction(InferenceAction):

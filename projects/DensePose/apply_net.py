@@ -456,6 +456,143 @@ class IUVAction(InferenceAction):
         pass
 
 @register_action
+class BatchIUVAction(InferenceAction):
+    """
+    Action that outputs IUV images using batch processing for higher throughput on GPU.
+    """
+
+    COMMAND: ClassVar[str] = "batchiuv"
+
+    @classmethod
+    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
+        parser = subparsers.add_parser(
+            cls.COMMAND, help="Dump IUV images in batches for high performance."
+        )
+        cls.add_arguments(parser)
+        parser.set_defaults(func=cls.execute)
+
+    @classmethod
+    def add_arguments(cls: type, parser: argparse.ArgumentParser):
+        super(BatchIUVAction, cls).add_arguments(parser)
+        parser.add_argument(
+            "--output",
+            metavar="<dump_file>",
+            default="output_iuv.png",
+            help="File name template to save IUV images to.",
+        )
+        parser.add_argument(
+            "--batch-size",
+            metavar="<N>",
+            type=int,
+            default=8,
+            help="Number of images to process in a single batch. Adjust based on GPU memory.",
+        )
+
+    @staticmethod
+    def _create_iuv_image_from_output(original_image, outputs):
+        """Helper function to generate a single IUV image from a model output."""
+        import cv2
+        import numpy as np
+
+        if not outputs.has("pred_densepose") or not isinstance(
+            outputs.pred_densepose, DensePoseChartPredictorOutput
+        ):
+            return None # Skip if no valid output
+
+        h, w, _ = original_image.shape
+        iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        extractor = DensePoseResultExtractor()
+        densepose_results = extractor(outputs)[0]
+
+        if not densepose_results:
+            return iuv_image # Return black image if no detections
+
+        for i, result in enumerate(densepose_results):
+            x, y, w_box, h_box = outputs.pred_boxes.tensor[i].int().tolist()
+            
+            i_map = result.labels.squeeze().to(torch.uint8)
+            u_map = (result.uv.squeeze()[0] * 255).to(torch.uint8)
+            v_map = (result.uv.squeeze()[1] * 255).to(torch.uint8)
+
+            # OpenCV uses BGR order, so we stack (V, U, I)
+            iuv_patch = torch.stack([v_map, u_map, i_map], dim=-1).cpu().numpy()
+            mask = iuv_patch[:, :, 2] > 0
+            
+            y1, y2 = y, y + h_box
+            x1, x2 = x, x + w_box
+            
+            # Clip coordinates to be within image bounds
+            y1_p, y2_p = max(0, y1), min(h, y2)
+            x1_p, x2_p = max(0, x1), min(w, x2)
+
+            y1_patch, y2_patch = y1_p - y1, y1_p - y1 + (y2_p - y1_p)
+            x1_patch, x2_patch = x1_p - x1, x1_p - x1 + (x2_p - x1_p)
+            
+            iuv_image[y1_p:y2_p, x1_p:x2_p][mask[y1_patch:y2_patch, x1_patch:x2_patch]] = \
+                iuv_patch[y1_patch:y2_patch, x1_patch:x2_patch][mask[y1_patch:y2_patch, x1_patch:x2_patch]]
+        
+        return iuv_image
+
+    @classmethod
+    def execute(cls: type, args: argparse.Namespace):
+        import cv2
+        from detectron2.data import transforms as T
+
+        logger.info(f"Loading config from {args.cfg}")
+        cfg = cls.setup_config(args.cfg, args.model, args, [])
+        logger.info(f"Loading model from {args.model}")
+        
+        # We need the model directly, not the DefaultPredictor
+        model = DefaultPredictor(cfg).model
+        
+        logger.info(f"Loading data from {args.input}")
+        file_list = cls._get_input_file_list(args.input)
+        if len(file_list) == 0:
+            logger.warning(f"No input images for {args.input}")
+            return
+            
+        # Create batches of file names
+        batch_size = args.batch_size
+        batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
+        
+        file_idx = 0
+        context = {"total_entries": len(file_list), "out_fname": args.output}
+        
+        for batch_files in tqdm(batches, desc=f"Processing in batches of {batch_size}"):
+            # 1. Load and preprocess a batch of images
+            batch_inputs = []
+            original_images = []
+            for file_name in batch_files:
+                original_image = read_image(file_name, format="BGR")
+                original_images.append(original_image)
+                height, width = original_image.shape[:2]
+                # Preprocessing from DefaultPredictor logic
+                aug = T.ResizeShortestEdge([cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST)
+                image = aug.get_transform(original_image).apply_image(original_image)
+                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+                batch_inputs.append({"image": image, "height": height, "width": width})
+
+            # 2. Run inference on the whole batch
+            with torch.no_grad():
+                # The model can take a list of inputs and processes them in a batch
+                batch_outputs = model(batch_inputs)
+            
+            # 3. Post-process and save results for this batch
+            for i in range(len(batch_outputs)):
+                outputs_per_image = {"instances": batch_outputs[i]["instances"]}
+                iuv_image = cls._create_iuv_image_from_output(original_images[i], outputs_per_image["instances"])
+                
+                if iuv_image is not None:
+                    out_fname = cls._get_out_fname(context, file_idx, args.output)
+                    out_dir = os.path.dirname(out_fname)
+                    if len(out_dir) > 0 and not os.path.exists(out_dir):
+                        os.makedirs(out_dir)
+                    cv2.imwrite(out_fname, iuv_image)
+                
+                file_idx += 1
+
+@register_action
 class ShowAction(InferenceAction):
     """
     Show action that visualizes selected entries on an image

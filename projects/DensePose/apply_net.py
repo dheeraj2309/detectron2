@@ -275,24 +275,17 @@ class DumpPlainAction(InferenceAction):
     def _convert_densepose_to_dict(cls: type, densepose_result):
         """
         Converts a DensePoseData object to a dictionary of tensors.
-        This is the core of the solution.
         """
-        # DensePoseData is a dataclass, we can inspect its fields.
-        # Common fields include 'uv', 'labels', 'i', 's'. We save them as tensors.
-        # We use .cpu() to move data from GPU to CPU before saving.
         plain_result = {}
-        if hasattr(densepose_result, "uv"):
-            plain_result["uv"] = densepose_result.uv.cpu()
-        if hasattr(densepose_result, "labels"):
-            # labels is the segmentation mask for the parts
-            plain_result["labels"] = densepose_result.labels.cpu()
         # For Chart-based models (i, u, v)
-        if hasattr(densepose_result, "i"):
-            plain_result["i"] = densepose_result.i.cpu()
+        if hasattr(densepose_result, "labels") and densepose_result.labels is not None:
+            # labels is the segmentation mask for the parts, equivalent to I
+            plain_result["labels"] = densepose_result.labels.cpu()
+        if hasattr(densepose_result, "uv") and densepose_result.uv is not None:
+            plain_result["uv"] = densepose_result.uv.cpu()
         # For CSE-based models (embedding)
-        if hasattr(densepose_result, "embedding"):
+        if hasattr(densepose_result, "embedding") and densepose_result.embedding is not None:
             plain_result["embedding"] = densepose_result.embedding.cpu()
-
         return plain_result
 
     @classmethod
@@ -300,7 +293,6 @@ class DumpPlainAction(InferenceAction):
         cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
     ):
         image_fpath = entry["file_name"]
-        logger.info(f"Processing {image_fpath}")
         result = {"file_name": image_fpath}
 
         if outputs.has("scores"):
@@ -309,21 +301,18 @@ class DumpPlainAction(InferenceAction):
             result["pred_boxes_XYXY"] = outputs.get("pred_boxes").tensor.cpu()
 
         if outputs.has("pred_densepose"):
-            # Determine the correct extractor based on the output type
             if isinstance(outputs.pred_densepose, DensePoseChartPredictorOutput):
                 extractor = DensePoseResultExtractor()
             elif isinstance(outputs.pred_densepose, DensePoseEmbeddingPredictorOutput):
                 extractor = DensePoseOutputsExtractor()
             else:
-                # If we don't know the type, we can't extract safely.
                 result["pred_densepose"] = []
                 context["results"].append(result)
                 return
 
-            # pred_densepose_results is a list of custom DensePoseData objects
             pred_densepose_results = extractor(outputs)[0]
             
-            # This is the crucial part: convert each custom object to a plain dictionary
+            # Convert each custom object to a plain dictionary
             plain_densepose_results = [
                 cls._convert_densepose_to_dict(dp_res) for dp_res in pred_densepose_results
             ]
@@ -333,7 +322,6 @@ class DumpPlainAction(InferenceAction):
 
     @classmethod
     def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
-        # We don't need the verification code from the original postexecute
         context = {"results": [], "out_fname": args.output}
         return context
 
@@ -345,8 +333,9 @@ class DumpPlainAction(InferenceAction):
             os.makedirs(out_dir)
         with open(out_fname, "wb") as hFile:
             torch.save(context["results"], hFile)
-            logger.info(f"Output saved to {out_fname}")
-        logger.info("Successfully saved plain data. This file can now be loaded anywhere without the DensePose project.")
+            logger.info(f"Plain data output saved to {out_fname}")
+        logger.info("This file can now be loaded anywhere with PyTorch, without the DensePose project.")
+
 
 @register_action
 class IUVAction(InferenceAction):
@@ -368,10 +357,9 @@ class IUVAction(InferenceAction):
         parser.add_argument(
             "--output",
             metavar="<output_dir>",
-            default="output/densepose",
+            default="output/densepose_iuv",
             help="Directory to save IUV image outputs. Will preserve input folder structure.",
         )
-        # Add an argument to define the root of the input dataset for relative path calculation
         parser.add_argument(
             "--input-root",
             metavar="<input_root>",
@@ -381,12 +369,12 @@ class IUVAction(InferenceAction):
 
     @classmethod
     def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
-        # The extractor to get DensePose results from model outputs
         extractor = DensePoseResultExtractor()
         context = {"extractor": extractor, "output_dir": args.output, "input_root": args.input_root}
         if args.input_root and not os.path.isdir(args.input_root):
-            logger.error(f"Provided --input-root '{args.input_root}' is not a valid directory.")
-            raise NotADirectoryError(f"Provided --input-root '{args.input_root}' is not a valid directory.")
+            msg = f"Provided --input-root '{args.input_root}' is not a valid directory."
+            logger.error(msg)
+            raise NotADirectoryError(msg)
         return context
 
     @classmethod
@@ -394,96 +382,69 @@ class IUVAction(InferenceAction):
         cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
     ):
         extractor = context["extractor"]
-        # Extract DensePose results from model outputs
         results_densepose = extractor(outputs)[0]
-        pred_boxes = outputs.pred_boxes.tensor.cpu()
-
-        # Create a blank image to store the IUV map
+        
         h, w, _ = entry["image"].shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # Results are sorted by score, so later instances (higher score) overwrite earlier ones.
-        if results_densepose:
-            # result is a DensePoseData object
+        # The results are sorted by score, so we take the first one.
+        if results_densepose and outputs.has("pred_boxes"):
+            # Get the best detection's data
             dp_result = results_densepose[0]
-            box = pred_boxes[0].to(dtype=torch.int).numpy()
+            box_xywh = outputs.pred_boxes.tensor[0].cpu().int().numpy()
+            x, y, ww, hh = box_xywh
+            box_xyxy = [x, y, x + ww, y + hh]
+            
             i_map_tensor = dp_result.labels
             uv_map_tensor = dp_result.uv
 
-            i_map = i_map_tensor.cpu().numpy()
-            # The UV tensor is shape (2, H, W). Index 1 is U, Index 0 is V.
-            u_map = uv_map_tensor.cpu().numpy()[1, :, :]
-            v_map = uv_map_tensor.cpu().numpy()[0, :, :]
+            # Create the IUV data for the bounding box
+            i_map = i_map_tensor.cpu().numpy().astype(np.uint8)
+            u_map = (uv_map_tensor.cpu().numpy()[1, :, :] * 255).astype(np.uint8)
+            v_map = (uv_map_tensor.cpu().numpy()[0, :, :] * 255).astype(np.uint8)
             
-            # Use BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
-            iuv_in_box = np.stack(
-                [
-                    i_map.astype(np.uint8),
-                    (u_map * 255).astype(np.uint8),
-                    (v_map * 255).astype(np.uint8),
-                ],
-                axis=2,
-            )
+            # BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
+            iuv_in_box = np.stack([i_map, u_map, v_map], axis=2)
             
-            # Create a mask for where to paint the IUV data
-            mask = i_map > 0
-            x1,y1,x2,y2 = box
+            # Define the region to paste into, with clipping
+            x1_img, y1_img = max(box_xyxy[0], 0), max(box_xyxy[1], 0)
+            x2_img, y2_img = min(box_xyxy[2], w), min(box_xyxy[3], h)
             
-            # Define slices for copying data to avoid out-of-bounds errors
-            img_y1_clipped = max(y1, 0)
-            img_y2_clipped = min(y2, h)
-            img_x1_clipped = max(x1, 0)
-            img_x2_clipped = min(x2, w)
+            # Define the source region from the IUV data
+            x1_src = x1_img - box_xyxy[0]
+            y1_src = y1_img - box_xyxy[1]
+            x2_src = x1_src + (x2_img - x1_img)
+            y2_src = y1_src + (y2_img - y1_img)
             
-            # 2. Determine the height and width of this valid, clipped region.
-            clipped_height = img_y2_clipped - img_y1_clipped
-            clipped_width = img_x2_clipped - img_x1_clipped
+            if x2_src > x1_src and y2_src > y1_src:
+                mask = i_map[y1_src:y2_src, x1_src:x2_src] > 0
+                iuv_patch = iuv_in_box[y1_src:y2_src, x1_src:x2_src]
+                iuv_image[y1_img:y2_img, x1_img:x2_img][mask] = iuv_patch[mask]
 
-            # If the intersection is empty, do nothing.
-            if clipped_height > 0 and clipped_width > 0:
-                # 3. Create slices for the source data (the full iuv_in_box).
-                box_y1_clipped = img_y1_clipped - y1
-                box_y2_clipped = img_y2_clipped - y1
-                box_x1_clipped = img_x1_clipped - x1
-                box_x2_clipped = img_x2_clipped - x1
-
-                source_slice = (slice(box_y1_clipped, box_y2_clipped), slice(box_x1_clipped, box_x2_clipped))
-
-                # 4. Get the relevant part of the mask and the data.
-                mask_clipped = i_map[source_slice] > 0
-                data_to_paste = iuv_in_box[source_slice]
-
-                # 5. Create slices for the destination image.
-                dest_slice = (slice(img_y1_clipped, img_y2_clipped), slice(img_x1_clipped, img_x2_clipped))
-                
-                # 6. Use the mask to place data onto the corresponding region of the main image.
-                # This is a more direct and robust assignment.
-                dest_region = iuv_image[dest_slice]
-                dest_region[mask_clipped] = data_to_paste[mask_clipped]
-                iuv_image[dest_slice] = dest_region
-
-        # --- Determine and create output path ---
+        # Determine and create output path
         file_name = entry["file_name"]
         input_root = context.get("input_root")
 
         if input_root:
-            # Preserve directory structure relative to the input_root
-            relative_path = os.path.relpath(file_name, input_root)
-            out_path = os.path.join(context["output_dir"], relative_path)
-        else:
-            # Use a flat structure in the output directory
+            relative_path = os.path.relpath(os.path.dirname(file_name), input_root)
             base_name = os.path.basename(file_name)
-            out_path = os.path.join(context["output_dir"], base_name)
+            out_dir = os.path.join(context["output_dir"], relative_path)
+            out_path = os.path.join(out_dir, base_name)
+        else:
+            base_name = os.path.basename(file_name)
+            out_dir = context["output_dir"]
+            out_path = os.path.join(out_dir, base_name)
             
         # Change extension to .png for lossless saving
         out_path = os.path.splitext(out_path)[0] + ".png"
 
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
         cv2.imwrite(out_path, iuv_image)
 
     @classmethod
     def postexecute(cls: type, context: Dict[str, Any]):
         logger.info(f"Finished processing. IUV images saved in {context['output_dir']}")
+
 
 @register_action
 class ShowAction(InferenceAction):

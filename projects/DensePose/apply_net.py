@@ -489,15 +489,19 @@ class BatchIUVAction(InferenceAction):
         )
 
     @staticmethod
+    @staticmethod
     def _create_iuv_image_from_output(original_image, outputs):
         """Helper function to generate a single IUV image from a model output."""
         import cv2
         import numpy as np
 
+        # Check for valid DensePose output
         if not outputs.has("pred_densepose") or not isinstance(
             outputs.pred_densepose, DensePoseChartPredictorOutput
         ):
-            return None # Skip if no valid output
+            # If no densepose output, create a black image of the correct size
+            h, w, _ = original_image.shape
+            return np.zeros((h, w, 3), dtype=np.uint8)
 
         h, w, _ = original_image.shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
@@ -509,28 +513,49 @@ class BatchIUVAction(InferenceAction):
             return iuv_image # Return black image if no detections
 
         for i, result in enumerate(densepose_results):
-            x, y, w_box, h_box = outputs.pred_boxes.tensor[i].int().tolist()
+            # --- START OF FIX ---
+            # Correctly get bounding box coordinates [x1, y1, x2, y2]
+            x1, y1, x2, y2 = outputs.pred_boxes.tensor[i].int().tolist()
             
+            # The result data (i, u, v maps) is already cropped to the bounding box size
+            # Its shape is (h_box, w_box)
             i_map = result.labels.squeeze().to(torch.uint8)
             u_map = (result.uv.squeeze()[0] * 255).to(torch.uint8)
             v_map = (result.uv.squeeze()[1] * 255).to(torch.uint8)
 
             # OpenCV uses BGR order, so we stack (V, U, I)
             iuv_patch = torch.stack([v_map, u_map, i_map], dim=-1).cpu().numpy()
+            
+            # The mask must have the same HxW dimensions as the patch
             mask = iuv_patch[:, :, 2] > 0
             
-            y1, y2 = y, y + h_box
-            x1, x2 = x, x + w_box
-            
-            # Clip coordinates to be within image bounds
-            y1_p, y2_p = max(0, y1), min(h, y2)
-            x1_p, x2_p = max(0, x1), min(w, x2)
+            # Define the destination region on the main image
+            # Slicing is exclusive of the end index, so this is correct
+            y_dst_start, y_dst_end = y1, y2
+            x_dst_start, x_dst_end = x1, x2
 
-            y1_patch, y2_patch = y1_p - y1, y1_p - y1 + (y2_p - y1_p)
-            x1_patch, x2_patch = x1_p - x1, x1_p - x1 + (x2_p - x1_p)
+            # The source patch has its own dimensions
+            patch_h, patch_w, _ = iuv_patch.shape
+
+            # Ensure the destination slice size matches the patch size
+            if (y_dst_end - y_dst_start) != patch_h or (x_dst_end - x_dst_start) != patch_w:
+                # This can happen if the bounding box from the model is slightly different
+                # from the size of the generated UV map. We resize the patch to fit.
+                iuv_patch = cv2.resize(iuv_patch, (x_dst_end - x_dst_start, y_dst_end - y_dst_start), interpolation=cv2.INTER_NEAREST)
+                mask = cv2.resize(mask.astype(np.uint8), (x_dst_end - x_dst_start, y_dst_end - y_dst_start), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+            # Clip coordinates to be safely within the image boundaries to prevent any errors
+            y_dst_start = max(0, y_dst_start)
+            y_dst_end = min(h, y_dst_end)
+            x_dst_start = max(0, x_dst_start)
+            x_dst_end = min(w, x_dst_end)
             
-            iuv_image[y1_p:y2_p, x1_p:x2_p][mask[y1_patch:y2_patch, x1_patch:x2_patch]] = \
-                iuv_patch[y1_patch:y2_patch, x1_patch:x2_patch][mask[y1_patch:y2_patch, x1_patch:x2_patch]]
+            # Paste the patch
+            region_to_write = iuv_image[y_dst_start:y_dst_end, x_dst_start:x_dst_end]
+            
+            # Only write where the mask is true
+            region_to_write[mask] = iuv_patch[mask]
+            # --- END OF FIX ---
         
         return iuv_image
 

@@ -517,52 +517,57 @@ class BatchIUVAction(InferenceAction):
         for i, result in enumerate(densepose_results):
             # --- START OF THE CORRECT FIX ---
 
-            # Get the original bounding box top-left corner
+            # 1. Get the original bounding box top-left corner. We only need the starting point.
             x1, y1, _, _ = outputs.pred_boxes.tensor[i].int().tolist()
             
-            # Extract the I, U, V maps. Squeeze to ensure they are 2D.
+            # 2. Extract the I, U, V maps. Squeeze to ensure they are 2D.
             i_map = result.labels.squeeze()
             uv_map = result.uv.squeeze()
 
-            # Ensure we have valid 2D maps to work with
+            # Ensure we have valid 2D maps to work with before proceeding
             if i_map.dim() != 2 or uv_map.dim() != 3 or uv_map.shape[0] != 2:
+                logger.warning("Skipping an instance due to unexpected DensePose map dimensions.")
                 continue
 
             u_map = (uv_map[0, :, :] * 255).to(torch.uint8).cpu().numpy()
             v_map = (uv_map[1, :, :] * 255).to(torch.uint8).cpu().numpy()
             i_map = i_map.to(torch.uint8).cpu().numpy()
             
-            # Get the true height and width from the IUV map itself
+            # 3. CRITICAL: Get the true height and width from the IUV map itself, NOT the bounding box.
             patch_h, patch_w = i_map.shape
             
-            # Create the 3-channel IUV patch from the individual maps
+            # 4. Create the 3-channel IUV patch from the individual maps
             # OpenCV uses BGR order, so we stack (V, U, I)
             iuv_patch = np.stack([v_map, u_map, i_map], axis=-1)
             
-            # Create the mask from the I-channel (body part index)
+            # 5. Create the mask from the I-channel (body part index)
             # Any pixel that is part of a body will be > 0
             mask = iuv_patch[:, :, 2] > 0
             
-            # Define the destination bounding box *based on the patch size*
+            # 6. Define the destination bounding box *based on the patch's actual size*
             x2 = x1 + patch_w
             y2 = y1 + patch_h
 
-            # Clip coordinates to be safely within the full image boundaries
-            y1_c, y2_c = max(0, y1), min(h, y2)
-            x1_c, x2_c = max(0, x1), min(w, x2)
+            # 7. Clip coordinates to be safely within the full image boundaries
+            y1_c = max(0, y1)
+            y2_c = min(h, y2)
+            x1_c = max(0, x1)
+            x2_c = min(w, x2)
             
-            # Calculate the corresponding slices of the patch to use
-            y_patch_start, y_patch_end = y1_c - y1, y2_c - y1
-            x_patch_start, x_patch_end = x1_c - x1, x2_c - x1
+            # 8. Calculate the corresponding slices of the patch to use, in case it was clipped
+            y_patch_start = y1_c - y1
+            y_patch_end = y_patch_start + (y2_c - y1_c)
+            x_patch_start = x1_c - x1
+            x_patch_end = x_patch_start + (x2_c - x1_c)
             
-            # Select the valid regions from the patch and the mask
+            # 9. Select the valid (non-clipped) regions from the patch and the mask
             valid_patch = iuv_patch[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
             valid_mask = mask[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
             
-            # Get the destination region in the final image
+            # 10. Get the destination region in the final image
             region_to_write = iuv_image[y1_c:y2_c, x1_c:x2_c]
             
-            # Paste the patch, using the mask to only affect relevant pixels
+            # 11. Paste the patch, using the mask to only affect relevant pixels
             region_to_write[valid_mask] = valid_patch[valid_mask]
             
             # --- END OF THE CORRECT FIX ---

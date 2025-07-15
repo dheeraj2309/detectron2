@@ -8,6 +8,8 @@ import os
 import sys
 from typing import Any, ClassVar, Dict, List
 import torch
+import numpy as np
+from tqdm import tqdm
 
 from detectron2.config import CfgNode, get_cfg
 from detectron2.data.detection_utils import read_image
@@ -97,9 +99,14 @@ class InferenceAction(Action):
         if len(file_list) == 0:
             logger.warning(f"No input images for {args.input}")
             return
+        # Create context and add total number of entries
         context = cls.create_context(args, cfg)
-        for file_name in file_list:
+        context["total_entries"] = len(file_list)
+
+        for i, file_name in enumerate(file_list):
             img = read_image(file_name, format="BGR")  # predictor expects BGR image.
+            # Add current entry index to context
+            context["entry_idx"] = i
             with torch.no_grad():
                 outputs = predictor(img)["instances"]
                 cls.execute_on_outputs(context, {"file_name": file_name, "image": img}, outputs)
@@ -132,6 +139,50 @@ class InferenceAction(Action):
         else:
             file_list = glob.glob(input_spec)
         return file_list
+    
+    # NEW a_get_out_fname METHOD IN THE BASE CLASS
+    @classmethod
+    def _get_out_fname(cls: type, context: Dict[str, Any], entry_idx: int, fname_base: str):
+        """
+        Gets the output file name for a given entry index.
+        If there is only one entry, returns the base file name.
+        Otherwise, appends a formatted index to the file name.
+        """
+        base, ext = os.path.splitext(fname_base)
+        if context["total_entries"] > 1:
+            return base + ".{0:04d}".format(entry_idx) + ext
+        return fname_base
+    
+    @classmethod
+    def execute(cls: type, args: argparse.Namespace):
+        logger.info(f"Loading config from {args.cfg}")
+        opts = []
+        cfg = cls.setup_config(args.cfg, args.model, args, opts)
+        logger.info(f"Loading model from {args.model}")
+        predictor = DefaultPredictor(cfg)
+        logger.info(f"Loading data from {args.input}")
+        file_list = cls._get_input_file_list(args.input)
+        if len(file_list) == 0:
+            logger.warning(f"No input images for {args.input}")
+            return
+        # Create context and add total number of entries
+        context = cls.create_context(args, cfg)
+        context["total_entries"] = len(file_list)
+
+        # ------------------- PROGRESS BAR CHANGE IS HERE -------------------
+        # Wrap the file_list with tqdm to create a progress bar
+        print(f"Found {len(file_list)} images to process.")
+        iterable = tqdm(file_list, desc="Processing Images")
+        
+        for i, file_name in enumerate(iterable):
+        # -------------------------------------------------------------------
+            img = read_image(file_name, format="BGR")  # predictor expects BGR image.
+            # Add current entry index to context
+            context["entry_idx"] = i
+            with torch.no_grad():
+                outputs = predictor(img)["instances"]
+                cls.execute_on_outputs(context, {"file_name": file_name, "image": img}, outputs)
+        cls.postexecute(context)
 
 
 @register_action
@@ -296,6 +347,113 @@ class DumpPlainAction(InferenceAction):
             logger.info(f"Output saved to {out_fname}")
         logger.info("Successfully saved plain data. This file can now be loaded anywhere without the DensePose project.")
 
+@register_action
+class IUVAction(InferenceAction):
+    """
+    Action that outputs IUV images.
+    An IUV image is a 3-channel image where the channels are encoded as follows:
+    - Channel 0 (Blue): V coordinate
+    - Channel 1 (Green): U coordinate
+    - Channel 2 (Red): Body part index (I)
+    Note: OpenCV uses BGR order, so we save (V, U, I) to get (B, G, R).
+    """
+
+    COMMAND: ClassVar[str] = "iuv"
+
+    @classmethod
+    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
+        parser = subparsers.add_parser(cls.COMMAND, help="Dump IUV image outputs.")
+        cls.add_arguments(parser)
+        parser.set_defaults(func=cls.execute)
+
+    @classmethod
+    def add_arguments(cls: type, parser: argparse.ArgumentParser):
+        super(IUVAction, cls).add_arguments(parser)
+        parser.add_argument(
+            "--output",
+            metavar="<dump_file>",
+            default="output_iuv.png",
+            help="File name to save IUV image to.",
+        )
+
+    @classmethod
+    def execute_on_outputs(
+        cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
+    ):
+        import cv2
+        import numpy as np # Ensure numpy is imported
+
+        image_fpath = entry["file_name"]
+        logger.info(f"Processing {image_fpath}")
+
+        # Ensure model output is for chart-based models which have I,U,V data
+        if not outputs.has("pred_densepose") or not isinstance(
+            outputs.pred_densepose, DensePoseChartPredictorOutput
+        ):
+            logger.warning(
+                f"Could not find DensePoseChartPredictorOutput in outputs for {image_fpath}. Skipping."
+            )
+            return
+
+        # Create a blank (black) image to draw the IUV data on
+        h, w, _ = entry["image"].shape
+        iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Extractor gets the IUV data from the raw model output
+        extractor = DensePoseResultExtractor()
+        densepose_results = extractor(outputs)[0]
+
+        if not densepose_results:
+            logger.warning(f"No DensePose detections for {image_fpath}. Saving black image.")
+        else:
+            # Iterate over each detected instance
+            for i, result in enumerate(densepose_results):
+                x, y, w_box, h_box = outputs.pred_boxes.tensor[i].int().tolist()
+                
+                i_map = result.labels.squeeze().to(torch.uint8)
+                u_map = (result.uv.squeeze()[0] * 255).to(torch.uint8)
+                v_map = (result.uv.squeeze()[1] * 255).to(torch.uint8)
+
+                # OpenCV uses BGR order, so we stack (V, U, I) to save correctly.
+                iuv_patch = torch.stack([v_map, u_map, i_map], dim=-1).cpu().numpy()
+                mask = iuv_patch[:, :, 2] > 0
+                
+                # Ensure the patch fits within the image boundaries
+                y1, y2 = y, y + h_box
+                x1, x2 = x, x + w_box
+                patch_h, patch_w, _ = iuv_patch.shape
+                
+                # Clip coordinates to be within image bounds
+                y1_p, y2_p = max(0, y1), min(h, y2)
+                x1_p, x2_p = max(0, x1), min(w, x2)
+
+                # Calculate corresponding slice from the patch
+                y1_patch = y1_p - y1
+                y2_patch = y1_patch + (y2_p - y1_p)
+                x1_patch = x1_p - x1
+                x2_patch = x1_patch + (x2_p - x1_p)
+
+                # Paste the valid part of the IUV patch onto the main IUV image
+                iuv_image[y1_p:y2_p, x1_p:x2_p][mask[y1_patch:y2_patch, x1_patch:x2_patch]] = \
+                    iuv_patch[y1_patch:y2_patch, x1_patch:x2_patch][mask[y1_patch:y2_patch, x1_patch:x2_patch]]
+
+        entry_idx = context["entry_idx"]
+        out_fname = cls._get_out_fname(context, entry_idx, context["out_fname"])
+        out_dir = os.path.dirname(out_fname)
+        if len(out_dir) > 0 and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        
+        cv2.imwrite(out_fname, iuv_image)
+        logger.info(f"IUV image saved to {out_fname}")
+
+    @classmethod
+    def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode) -> Dict[str, Any]:
+        context = { "out_fname": args.output }
+        return context
+
+    @classmethod
+    def postexecute(cls: type, context: Dict[str, Any]):
+        pass
 
 @register_action
 class ShowAction(InferenceAction):
@@ -386,23 +544,19 @@ class ShowAction(InferenceAction):
         image = np.tile(image[:, :, np.newaxis], [1, 1, 3])
         data = extractor(outputs)
         image_vis = visualizer.visualize(image, data)
-        entry_idx = context["entry_idx"] + 1
-        out_fname = cls._get_out_fname(entry_idx, context["out_fname"])
+        entry_idx = context["entry_idx"]
+        # UPDATED CALL to _get_out_fname
+        out_fname = cls._get_out_fname(context, entry_idx, context["out_fname"])
         out_dir = os.path.dirname(out_fname)
         if len(out_dir) > 0 and not os.path.exists(out_dir):
             os.makedirs(out_dir)
         cv2.imwrite(out_fname, image_vis)
         logger.info(f"Output saved to {out_fname}")
-        context["entry_idx"] += 1
 
     @classmethod
     def postexecute(cls: type, context: Dict[str, Any]):
         pass
 
-    @classmethod
-    def _get_out_fname(cls: type, entry_idx: int, fname_base: str):
-        base, ext = os.path.splitext(fname_base)
-        return base + ".{0:04d}".format(entry_idx) + ext
 
     @classmethod
     def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode) -> Dict[str, Any]:
@@ -426,7 +580,7 @@ class ShowAction(InferenceAction):
             "extractor": extractor,
             "visualizer": visualizer,
             "out_fname": args.output,
-            "entry_idx": 0,
+            # entry_idx is now managed by the base execute method
         }
         return context
 

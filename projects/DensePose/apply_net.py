@@ -427,13 +427,14 @@ class IUVAction(InferenceAction):
             
             # Create a mask for where to paint the IUV data
             mask = i_map > 0
+            x1,y1,x2,y2 = box
             
             # Define slices for copying data to avoid out-of-bounds errors
-            img_y1, img_y2 = max(0, y), min(h, y + box_h)
-            img_x1, img_x2 = max(0, x), min(w, x + box_w)
+            img_y1, img_y2 = max(0, y1), min(h, y2)
+            img_x1, img_x2 = max(0, x1), min(w, x2)
             
-            box_y1, box_y2 = img_y1 - y, img_y2 - y
-            box_x1, box_x2 = img_x1 - x, img_x2 - x
+            box_y1, box_y2 = img_y1 - y1, img_y2 - y1
+            box_x1, box_x2 = img_x1 - x1, img_x2 - x1
 
             # Combine masks and copy data
             img_slice = (slice(img_y1, img_y2), slice(img_x1, img_x2))

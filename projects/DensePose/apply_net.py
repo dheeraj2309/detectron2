@@ -397,7 +397,7 @@ class IUVAction(InferenceAction):
         # Extract DensePose results from model outputs
         results_densepose = extractor(outputs)[0]
         pred_boxes = outputs.pred_boxes.tensor.cpu()
-        
+
         # Create a blank image to store the IUV map
         h, w, _ = entry["image"].shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
@@ -408,13 +408,14 @@ class IUVAction(InferenceAction):
             x1, y1, x2, y2 = pred_boxes[i]
             x, y = int(x1), int(y1)
             box_w, box_h = int(x2 - x1), int(y2 - y1)
+            print("yaha box ki dimesnions nikli hai")
 
             # Now, the rest of the original logic can proceed, as it has the correct bbox info.
             # Get the I, U, V data for the bounding box from the result object
             i_map = result.labels.cpu().numpy() # Note: it's in result.labels
             u_map = result.uv.cpu().numpy()[1, :, :]
             v_map = result.uv.cpu().numpy()[0, :, :]
-
+            print('yaha i , u , v ke map nikle')
             
             # Use BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
             iuv_in_box = np.stack(
@@ -442,7 +443,7 @@ class IUVAction(InferenceAction):
             
             mask_valid = mask[box_slice]
             iuv_image[img_slice][mask_valid] = iuv_in_box[box_slice][mask_valid]
-
+            print('yaha pe mask se image bnai h')
         # --- Determine and create output path ---
         file_name = entry["file_name"]
         input_root = context.get("input_root")

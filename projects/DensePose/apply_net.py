@@ -396,7 +396,8 @@ class IUVAction(InferenceAction):
         extractor = context["extractor"]
         # Extract DensePose results from model outputs
         results_densepose = extractor(outputs)[0]
-
+        pred_boxes = outputs.pred_boxes.tensor.cpu()
+        
         # Create a blank image to store the IUV map
         h, w, _ = entry["image"].shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)

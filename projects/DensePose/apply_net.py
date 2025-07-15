@@ -435,26 +435,33 @@ class IUVAction(InferenceAction):
             img_x1_clipped = max(x1, 0)
             img_x2_clipped = min(x2, w)
             
-            # If the intersection is empty (e.g., box is completely outside image), do nothing.
-            if img_y1_clipped >= img_y2_clipped or img_x1_clipped >= img_x2_clipped:
-                pass
-            else:
-                # Create slices for the destination iuv_image
-                img_slice_y = slice(img_y1_clipped, img_y2_clipped)
-                img_slice_x = slice(img_x1_clipped, img_x2_clipped)
-                print(f"img_slice_x:{img_slice_x.shape} img_slice_y :{img_slice_y.shape}")
+            # 2. Determine the height and width of this valid, clipped region.
+            clipped_height = img_y2_clipped - img_y1_clipped
+            clipped_width = img_x2_clipped - img_x1_clipped
+
+            # If the intersection is empty, do nothing.
+            if clipped_height > 0 and clipped_width > 0:
+                # 3. Create slices for the source data (the full iuv_in_box).
+                box_y1_clipped = img_y1_clipped - y1
+                box_y2_clipped = img_y2_clipped - y1
+                box_x1_clipped = img_x1_clipped - x1
+                box_x2_clipped = img_x2_clipped - x1
+
+                source_slice = (slice(box_y1_clipped, box_y2_clipped), slice(box_x1_clipped, box_x2_clipped))
+
+                # 4. Get the relevant part of the mask and the data.
+                mask_clipped = i_map[source_slice] > 0
+                data_to_paste = iuv_in_box[source_slice]
+
+                # 5. Create slices for the destination image.
+                dest_slice = (slice(img_y1_clipped, img_y2_clipped), slice(img_x1_clipped, img_x2_clipped))
                 
-                # Create corresponding slices for the source iuv_in_box and the mask.
-                # These are adjusted by the original box's top-left corner (x1, y1).
-                box_slice_y = slice(img_y1_clipped - y1, img_y2_clipped - y1)
-                box_slice_x = slice(img_x1_clipped - x1, img_x2_clipped - x1)
-                print(f"box_slice_x :{box_slice_x.shape} box_slice_y :{box_slice_y.shape}")
-                
-                # Now, the mask and the data we select from it will have the exact same dimensions
-                # as the destination slice in the iuv_image.
-                mask = i_map[box_slice_y, box_slice_x] > 0
-                print(f" iuv_in_box : {(iuv_in_box[box_slice_y, box_slice_x][mask].shape)}")
-                iuv_image[img_slice_y, img_slice_x][mask] = iuv_in_box[box_slice_y, box_slice_x][mask]
+                # 6. Use the mask to place data onto the corresponding region of the main image.
+                # This is a more direct and robust assignment.
+                dest_region = iuv_image[dest_slice]
+                dest_region[mask_clipped] = data_to_paste[mask_clipped]
+                iuv_image[dest_slice] = dest_region
+
         # --- Determine and create output path ---
         file_name = entry["file_name"]
         input_root = context.get("input_root")

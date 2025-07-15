@@ -191,49 +191,110 @@ class DumpAction(InferenceAction):
         with open(out_fname, "wb") as hFile:
             torch.save(context["results"], hFile)
             logger.info(f"Output saved to {out_fname}")
-        # ==============================================================================
-        # ===== START OF THE NEW VERIFICATION CODE THAT CANNOT FAIL ====================
-        # ==============================================================================
-        logger.info("=" * 60)
-        logger.info("VERIFICATION STEP: ATTEMPTING TO LOAD THE FILE WE JUST SAVED")
-        logger.info("=" * 60)
-        try:
-            # We use torch.load with weights_only=False because the file contains custom classes
-            loaded_data = torch.load(out_fname, weights_only=False)
 
-            logger.info(">>> SUCCESS! File loaded back without errors.")
-            logger.info(f"Type of loaded data: {type(loaded_data)}")
+@register_action
+class DumpPlainAction(InferenceAction):
+    """
+    Dump action that outputs results to a pickle file using only plain data
+    (tensors, dicts, lists) to avoid dependency issues on loading.
+    """
 
-            if isinstance(loaded_data, list) and len(loaded_data) > 0:
-                logger.info(f"Number of images processed: {len(loaded_data)}")
-                first_entry = loaded_data[0]
-                logger.info("--- Data for the first image ---")
-                logger.info(f"File Name: {first_entry.get('file_name')}")
-                logger.info(f"Scores: {first_entry.get('scores')}")
-                logger.info(f"Bounding Boxes: {first_entry.get('pred_boxes_XYXY')}")
-                # This shows you have the densepose data object
-                if first_entry.get('pred_densepose'):
-                    logger.info(f"Number of people detected: {len(first_entry.get('pred_densepose'))}")
-                    logger.info(f"Type of DensePose result object: {type(first_entry.get('pred_densepose')[0])}")
-                logger.info("-" * 34)
+    COMMAND: ClassVar[str] = "dumpplain"
 
-            # THIS IS WHERE YOU WOULD ADD YOUR OWN LOGIC TO PROCESS THE `loaded_data`
-            # For example:
-            # for entry in loaded_data:
-            #     print(f"Processing data for {entry['file_name']}")
-            #     # ... your logic here ...
+    @classmethod
+    def add_parser(cls: type, subparsers: argparse._SubParsersAction):
+        parser = subparsers.add_parser(
+            cls.COMMAND, help="Dump model outputs to a file using plain data types."
+        )
+        cls.add_arguments(parser)
+        parser.set_defaults(func=cls.execute)
 
-        except Exception as e:
-            logger.error(">>> FAILED to load back the data. This should not happen.")
-            logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"Error message: {e}")
-        logger.info("=" * 60)
-        logger.info("VERIFICATION COMPLETE. SCRIPT FINISHED.")
-        logger.info("=" * 60)
-        # ==============================================================================
-        # ===== END OF THE NEW VERIFICATION CODE =======================================
-        # ==============================================================================
+    @classmethod
+    def add_arguments(cls: type, parser: argparse.ArgumentParser):
+        super(DumpPlainAction, cls).add_arguments(parser)
+        parser.add_argument(
+            "--output",
+            metavar="<dump_file>",
+            default="results_plain.pkl",
+            help="File name to save plain data dump to",
+        )
 
+    @classmethod
+    def _convert_densepose_to_dict(cls: type, densepose_result):
+        """
+        Converts a DensePoseData object to a dictionary of tensors.
+        This is the core of the solution.
+        """
+        # DensePoseData is a dataclass, we can inspect its fields.
+        # Common fields include 'uv', 'labels', 'i', 's'. We save them as tensors.
+        # We use .cpu() to move data from GPU to CPU before saving.
+        plain_result = {}
+        if hasattr(densepose_result, "uv"):
+            plain_result["uv"] = densepose_result.uv.cpu()
+        if hasattr(densepose_result, "labels"):
+            # labels is the segmentation mask for the parts
+            plain_result["labels"] = densepose_result.labels.cpu()
+        # For Chart-based models (i, u, v)
+        if hasattr(densepose_result, "i"):
+            plain_result["i"] = densepose_result.i.cpu()
+        # For CSE-based models (embedding)
+        if hasattr(densepose_result, "embedding"):
+            plain_result["embedding"] = densepose_result.embedding.cpu()
+
+        return plain_result
+
+    @classmethod
+    def execute_on_outputs(
+        cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
+    ):
+        image_fpath = entry["file_name"]
+        logger.info(f"Processing {image_fpath}")
+        result = {"file_name": image_fpath}
+
+        if outputs.has("scores"):
+            result["scores"] = outputs.get("scores").cpu()
+        if outputs.has("pred_boxes"):
+            result["pred_boxes_XYXY"] = outputs.get("pred_boxes").tensor.cpu()
+
+        if outputs.has("pred_densepose"):
+            # Determine the correct extractor based on the output type
+            if isinstance(outputs.pred_densepose, DensePoseChartPredictorOutput):
+                extractor = DensePoseResultExtractor()
+            elif isinstance(outputs.pred_densepose, DensePoseEmbeddingPredictorOutput):
+                extractor = DensePoseOutputsExtractor()
+            else:
+                # If we don't know the type, we can't extract safely.
+                result["pred_densepose"] = []
+                context["results"].append(result)
+                return
+
+            # pred_densepose_results is a list of custom DensePoseData objects
+            pred_densepose_results = extractor(outputs)[0]
+            
+            # This is the crucial part: convert each custom object to a plain dictionary
+            plain_densepose_results = [
+                cls._convert_densepose_to_dict(dp_res) for dp_res in pred_densepose_results
+            ]
+            result["pred_densepose"] = plain_densepose_results
+
+        context["results"].append(result)
+
+    @classmethod
+    def create_context(cls: type, args: argparse.Namespace, cfg: CfgNode):
+        # We don't need the verification code from the original postexecute
+        context = {"results": [], "out_fname": args.output}
+        return context
+
+    @classmethod
+    def postexecute(cls: type, context: Dict[str, Any]):
+        out_fname = context["out_fname"]
+        out_dir = os.path.dirname(out_fname)
+        if len(out_dir) > 0 and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        with open(out_fname, "wb") as hFile:
+            torch.save(context["results"], hFile)
+            logger.info(f"Output saved to {out_fname}")
+        logger.info("Successfully saved plain data. This file can now be loaded anywhere without the DensePose project.")
 
 
 @register_action

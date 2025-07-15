@@ -489,112 +489,83 @@ class BatchIUVAction(InferenceAction):
         )
 
 
-    @staticmethod
+        @staticmethod
     def _create_iuv_image_from_output(original_image, outputs):
-        """Helper function to generate a single IUV image from a model output."""
+        """
+        Helper function to generate a single IUV image from a model output.
+        This version trusts the IUV map dimensions and adjusts the bounding box
+        to match, avoiding any data-corrupting resizing.
+        """
         import cv2
         import numpy as np
 
         h, w, _ = original_image.shape
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
 
+        # Check for valid DensePose output
         if not outputs.has("pred_densepose") or not isinstance(
             outputs.pred_densepose, DensePoseChartPredictorOutput
         ):
-            print("DEBUG: No DensePoseChartPredictorOutput found. Returning black image.")
             return iuv_image
 
         extractor = DensePoseResultExtractor()
         densepose_results = extractor(outputs)[0]
 
         if not densepose_results:
-            print("DEBUG: No DensePose detections in this image. Returning black image.")
             return iuv_image
 
-        print(f"\n--- DEBUG: Processing an image with {len(densepose_results)} detected instances ---")
         for i, result in enumerate(densepose_results):
-            print(f"\n--- Instance {i+1}/{len(densepose_results)} ---")
+            # --- START OF THE CORRECT FIX ---
+
+            # Get the original bounding box top-left corner
+            x1, y1, _, _ = outputs.pred_boxes.tensor[i].int().tolist()
             
-            # --- START OF DEBUGGING ---
-            x1, y1, x2, y2 = outputs.pred_boxes.tensor[i].int().tolist()
-            print(f"DEBUG: BBox (x1,y1,x2,y2): ({x1}, {y1}, {x2}, {y2})")
+            # Extract the I, U, V maps. Squeeze to ensure they are 2D.
+            i_map = result.labels.squeeze()
+            uv_map = result.uv.squeeze()
 
-            # Let's inspect the raw result tensors
-            print(f"DEBUG: Raw result.labels shape: {result.labels.shape}")
-            print(f"DEBUG: Raw result.uv shape: {result.uv.shape}")
-
-            i_map_raw = result.labels
-            uv_map_raw = result.uv
-
-            # Squeeze to remove any singleton dimensions
-            i_map = i_map_raw.squeeze()
-            uv_map = uv_map_raw.squeeze()
-            
-            print(f"DEBUG: Squeezed i_map shape: {i_map.shape} (should be 2D)")
-            print(f"DEBUG: Squeezed uv_map shape: {uv_map.shape} (should be 3D: 2 x H x W)")
-
-            # Defensive check
+            # Ensure we have valid 2D maps to work with
             if i_map.dim() != 2 or uv_map.dim() != 3 or uv_map.shape[0] != 2:
-                print(f"ERROR-DEBUG: Unexpected map dimensions! Skipping this instance.")
                 continue
 
-            u_map = uv_map[0, :, :]
-            v_map = uv_map[1, :, :]
-            print(f"DEBUG: Extracted u_map shape: {u_map.shape}")
-            print(f"DEBUG: Extracted v_map shape: {v_map.shape}")
+            u_map = (uv_map[0, :, :] * 255).to(torch.uint8).cpu().numpy()
+            v_map = (uv_map[1, :, :] * 255).to(torch.uint8).cpu().numpy()
+            i_map = i_map.to(torch.uint8).cpu().numpy()
             
-            # This is the line that creates the 3-channel torch tensor
-            try:
-                iuv_patch_torch = torch.stack([v_map, u_map, i_map], dim=-1)
-                print(f"DEBUG: torch.stack result `iuv_patch_torch` shape: {iuv_patch_torch.shape} (should be 3D: H x W x 3)")
-            except Exception as e:
-                print(f"ERROR-DEBUG: torch.stack failed! Error: {e}")
-                continue
-
-            # Convert to numpy
-            iuv_patch = iuv_patch_torch.cpu().numpy()
-            print(f"DEBUG: Converted to numpy `iuv_patch` shape: {iuv_patch.shape} (should be 3D: H x W x 3)")
-
-            # Check if resizing is needed, which was a potential point of failure
-            w_box, h_box = x2 - x1, y2 - y1
-            patch_h, patch_w, patch_c = iuv_patch.shape
-            print(f"DEBUG: BBox size (W, H): ({w_box}, {h_box}) vs Patch size (W, H): ({patch_w}, {patch_h})")
+            # Get the true height and width from the IUV map itself
+            patch_h, patch_w = i_map.shape
             
-            if h_box != patch_h or w_box != patch_w:
-                print(f"DEBUG: Resizing needed. Resizing from ({patch_w}, {patch_h}) to ({w_box}, {h_box})")
-                try:
-                    iuv_patch = cv2.resize(iuv_patch, (w_box, h_box), interpolation=cv2.INTER_NEAREST)
-                    print(f"DEBUG: Post-resize `iuv_patch` shape: {iuv_patch.shape} (should be 3D)")
-                except Exception as e:
-                    print(f"ERROR-DEBUG: cv2.resize failed! Error: {e}")
-                    continue
+            # Create the 3-channel IUV patch from the individual maps
+            # OpenCV uses BGR order, so we stack (V, U, I)
+            iuv_patch = np.stack([v_map, u_map, i_map], axis=-1)
             
-            # This is the line that failed before. Let's check the shape right before it.
-            print(f"DEBUG: FINAL `iuv_patch` shape before masking: {iuv_patch.shape}")
-            if iuv_patch.ndim != 3:
-                 print(f"CRITICAL-DEBUG: `iuv_patch` IS NOT 3D! It has {iuv_patch.ndim} dimensions. This will fail.")
-
-            # THE CRASHING LINE
+            # Create the mask from the I-channel (body part index)
+            # Any pixel that is part of a body will be > 0
             mask = iuv_patch[:, :, 2] > 0
-            # --- END OF DEBUGGING ---
+            
+            # Define the destination bounding box *based on the patch size*
+            x2 = x1 + patch_w
+            y2 = y1 + patch_h
 
-            # Clip coordinates to be safely within the image boundaries
+            # Clip coordinates to be safely within the full image boundaries
             y1_c, y2_c = max(0, y1), min(h, y2)
             x1_c, x2_c = max(0, x1), min(w, x2)
             
+            # Calculate the corresponding slices of the patch to use
             y_patch_start, y_patch_end = y1_c - y1, y2_c - y1
             x_patch_start, x_patch_end = x1_c - x1, x2_c - x1
             
+            # Select the valid regions from the patch and the mask
             valid_patch = iuv_patch[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
             valid_mask = mask[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
             
+            # Get the destination region in the final image
             region_to_write = iuv_image[y1_c:y2_c, x1_c:x2_c]
             
-            # Final check to prevent broadcast errors
-            if region_to_write[valid_mask].shape == valid_patch[valid_mask].shape:
-                region_to_write[valid_mask] = valid_patch[valid_mask]
-            else:
-                print("ERROR-DEBUG: Shape mismatch during final paste. Skipping paste for this instance.")
+            # Paste the patch, using the mask to only affect relevant pixels
+            region_to_write[valid_mask] = valid_patch[valid_mask]
+            
+            # --- END OF THE CORRECT FIX ---
         
         return iuv_image
 

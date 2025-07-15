@@ -430,19 +430,29 @@ class IUVAction(InferenceAction):
             x1,y1,x2,y2 = box
             
             # Define slices for copying data to avoid out-of-bounds errors
-            img_y1, img_y2 = max(0, y1), min(h, y2)
-            img_x1, img_x2 = max(0, x1), min(w, x2)
+            img_y1_clipped = max(y1, 0)
+            img_y2_clipped = min(y2, h)
+            img_x1_clipped = max(x1, 0)
+            img_x2_clipped = min(x2, w)
             
-            box_y1, box_y2 = img_y1 - y1, img_y2 - y1
-            box_x1, box_x2 = img_x1 - x1, img_x2 - x1
-
-            # Combine masks and copy data
-            img_slice = (slice(img_y1, img_y2), slice(img_x1, img_x2))
-            box_slice = (slice(box_y1, box_y2), slice(box_x1, box_x2))
-            
-            mask_valid = mask[box_slice]
-            iuv_image[img_slice][mask_valid] = iuv_in_box[box_slice][mask_valid]
-            print('yaha pe mask se image bnai h')
+            # If the intersection is empty (e.g., box is completely outside image), do nothing.
+            if img_y1_clipped >= img_y2_clipped or img_x1_clipped >= img_x2_clipped:
+                pass
+            else:
+                # Create slices for the destination iuv_image
+                img_slice_y = slice(img_y1_clipped, img_y2_clipped)
+                img_slice_x = slice(img_x1_clipped, img_x2_clipped)
+                
+                # Create corresponding slices for the source iuv_in_box and the mask.
+                # These are adjusted by the original box's top-left corner (x1, y1).
+                box_slice_y = slice(img_y1_clipped - y1, img_y2_clipped - y1)
+                box_slice_x = slice(img_x1_clipped - x1, img_x2_clipped - x1)
+                
+                # Now, the mask and the data we select from it will have the exact same dimensions
+                # as the destination slice in the iuv_image.
+                mask = i_map[box_slice_y, box_slice_x] > 0
+                
+                iuv_image[img_slice_y, img_slice_x][mask] = iuv_in_box[box_slice_y, box_slice_x][mask]
         # --- Determine and create output path ---
         file_name = entry["file_name"]
         input_root = context.get("input_root")

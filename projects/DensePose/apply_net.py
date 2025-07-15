@@ -155,6 +155,24 @@ class InferenceAction(Action):
         return fname_base
     
     @classmethod
+    def get_output_path(cls: type, file_name: str, output_dir: str, new_ext: str, input_root: str = None):
+        """Helper to determine the output path while preserving directory structure."""
+        if input_root:
+            # Ensure input_root is a directory path
+            root = input_root if os.path.isdir(input_root) else os.path.dirname(input_root)
+            relative_dir = os.path.relpath(os.path.dirname(file_name), root)
+            out_dir = os.path.join(output_dir, relative_dir)
+        else:
+            out_dir = output_dir
+        
+        base_name = os.path.basename(file_name)
+        out_name = os.path.splitext(base_name)[0] + new_ext
+        out_path = os.path.join(out_dir, out_name)
+        
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        return out_path
+    
+    @classmethod
     def execute(cls: type, args: argparse.Namespace):
         logger.info(f"Loading config from {args.cfg}")
         opts = []

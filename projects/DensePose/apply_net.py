@@ -489,7 +489,7 @@ class BatchIUVAction(InferenceAction):
         )
 
 
-        @staticmethod
+    @staticmethod
     def _create_iuv_image_from_output(original_image, outputs):
         """
         Helper function to generate a single IUV image from a model output.

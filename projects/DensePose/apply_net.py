@@ -488,8 +488,8 @@ class BatchIUVAction(InferenceAction):
             help="Number of images to process in a single batch. Adjust based on GPU memory.",
         )
 
+
     @staticmethod
-        @staticmethod
     def _create_iuv_image_from_output(original_image, outputs):
         """Helper function to generate a single IUV image from a model output."""
         import cv2

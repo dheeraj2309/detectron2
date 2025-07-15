@@ -442,16 +442,18 @@ class IUVAction(InferenceAction):
                 # Create slices for the destination iuv_image
                 img_slice_y = slice(img_y1_clipped, img_y2_clipped)
                 img_slice_x = slice(img_x1_clipped, img_x2_clipped)
+                print(f"img_slice_x:{img_slice_x.shape} img_slice_y :{img_slice_y.shape}")
                 
                 # Create corresponding slices for the source iuv_in_box and the mask.
                 # These are adjusted by the original box's top-left corner (x1, y1).
                 box_slice_y = slice(img_y1_clipped - y1, img_y2_clipped - y1)
                 box_slice_x = slice(img_x1_clipped - x1, img_x2_clipped - x1)
+                print(f"box_slice_x :{box_slice_x.shape} box_slice_y :{box_slice_y.shape}")
                 
                 # Now, the mask and the data we select from it will have the exact same dimensions
                 # as the destination slice in the iuv_image.
                 mask = i_map[box_slice_y, box_slice_x] > 0
-                
+                print(f" iuv_in_box : {(iuv_in_box[box_slice_y, box_slice_x][mask].shape)}")
                 iuv_image[img_slice_y, img_slice_x][mask] = iuv_in_box[box_slice_y, box_slice_x][mask]
         # --- Determine and create output path ---
         file_name = entry["file_name"]

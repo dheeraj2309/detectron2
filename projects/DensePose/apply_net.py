@@ -402,14 +402,18 @@ class IUVAction(InferenceAction):
         iuv_image = np.zeros((h, w, 3), dtype=np.uint8)
 
         # Results are sorted by score, so later instances (higher score) overwrite earlier ones.
-        for result in results_densepose:
+        for i,result in enumerate(results_densepose):
             # result is a DensePoseData object
-            x, y, box_w, box_h = result.bbox_xywh.cpu().numpy().astype(int)
+            x1, y1, x2, y2 = pred_boxes[i]
+            x, y = int(x1), int(y1)
+            box_w, box_h = int(x2 - x1), int(y2 - y1)
 
-            # Get the I, U, V data for the bounding box
-            i_map = result.i.cpu().numpy()
-            u_map = result.u.cpu().numpy()
-            v_map = result.v.cpu().numpy()
+            # Now, the rest of the original logic can proceed, as it has the correct bbox info.
+            # Get the I, U, V data for the bounding box from the result object
+            i_map = result.labels.cpu().numpy() # Note: it's in result.labels
+            u_map = result.uv.cpu().numpy()[1, :, :]
+            v_map = result.uv.cpu().numpy()[0, :, :]
+
             
             # Use BGR order for OpenCV: I -> Blue, U -> Green, V -> Red
             iuv_in_box = np.stack(
